@@ -43,27 +43,22 @@ func New(rate, burst int) (*RateLimiter, error) {
 func (s *RateLimiter) Wait() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// if bucket is empty: add tokens that are due, update last refill time
+
+	// if bucket is empty: wait for 60 seconds since the last token was used, refill the bucket to (bucketSize), 
+	// and set the last token time to time.Now() to set the new start of the period.
+	// this is unique to the GoDaddy APIs, which limit us to 60 requests every minute per endpoint.
+	// See: https://developer.godaddy.com/getstarted#terms
 	if s.numTokens <= 0 {
-		elapsedTime := time.Since(s.lastTokenTime)
-		tokensToAdd := int(elapsedTime.Nanoseconds() / s.period.Nanoseconds())
-		s.numTokens = tokensToAdd
-		if s.numTokens > s.bucketSize {
-			s.numTokens = s.bucketSize
-		}
-		s.lastTokenTime = s.lastTokenTime.Add(time.Duration(tokensToAdd) * s.period)
-	}
-	// if token available: ok, take it and release caller from the wait
-	if s.numTokens > 0 {
+		waitDuration := time.Since(s.lastTokenTime.Add(time.Second * 60))
+		time.Sleep(waitDuration)
+		s.numTokens = s.bucketSize
+		s.lastTokenTime = time.Now()
+	} else {
+		// if token available: ok, take it and release caller from the wait
 		s.numTokens--
+		s.lastTokenTime = time.Now()
 		return
 	}
-	// if still no tokens: will have to wait until nextTokenTime or cancel
-	nextTokenTime := s.lastTokenTime.Add(s.period)
-	waitDuration := time.Until(nextTokenTime)
-	time.Sleep(waitDuration)
-	// upd last token time and release from the wait
-	s.lastTokenTime = nextTokenTime
 }
 
 // block until token becomes available, with cancellable context
@@ -73,30 +68,28 @@ func (s *RateLimiter) WaitCtx(ctx context.Context) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// if bucket is empty: add tokens that are due, update last refill time
+	// if bucket is empty: wait for 60 seconds since the last token was used, refill the bucket to (bucketSize), 
+	// and set the last token time to time.Now() to set the new start of the period.
+	// this is unique to the GoDaddy APIs, which limit us to 60 requests every minute per endpoint.
+	// See: https://developer.godaddy.com/getstarted#terms
 	if s.numTokens <= 0 {
-		elapsedTime := time.Since(s.lastTokenTime)
-		tokensToAdd := int(elapsedTime.Nanoseconds() / s.period.Nanoseconds())
-		s.numTokens = tokensToAdd
-		if s.numTokens > s.bucketSize {
-			s.numTokens = s.bucketSize
+		waitDuration := time.Since(s.lastTokenTime.Add(time.Second * 60))
+		s.numTokens = s.bucketSize
+
+		select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(waitDuration):
 		}
-		s.lastTokenTime = s.lastTokenTime.Add(time.Duration(tokensToAdd) * s.period)
+		// if not cancelled: upd last token time and release from the wait
+		s.lastTokenTime = time.Now()
+		return nil
 	}
 	// if token available: ok, take it and release caller from the wait
 	if s.numTokens > 0 {
 		s.numTokens--
+		s.lastTokenTime = time.Now()
 		return nil
 	}
-	// if still no tokens: will have to wait until nextTokenTime or cancel
-	nextTokenTime := s.lastTokenTime.Add(s.period)
-	waitDuration := time.Until(nextTokenTime)
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(waitDuration):
-	}
-	// if not cancelled: upd last token time and release from the wait
-	s.lastTokenTime = nextTokenTime
 	return nil
 }
